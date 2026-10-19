@@ -61,6 +61,9 @@ public sealed class RemoteFileInfo
 
     /// <summary>Browser URL, used for native-file link stubs.</summary>
     public string? WebViewLink { get; set; }
+
+    /// <summary>Whether the current user may trash this item. Null when the provider does not report it.</summary>
+    public bool? CanTrash { get; set; }
 }
 
 public sealed class RemoteChange

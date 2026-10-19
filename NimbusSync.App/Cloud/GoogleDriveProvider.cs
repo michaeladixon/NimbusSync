@@ -25,7 +25,7 @@ public sealed class GoogleDriveProvider : ICloudProvider, IDisposable
     private const string FolderMime = "application/vnd.google-apps.folder";
     private const string ShortcutMime = "application/vnd.google-apps.shortcut";
     private const string GoogleAppsPrefix = "application/vnd.google-apps.";
-    private const string FileFields = "id,name,parents,mimeType,md5Checksum,size,modifiedTime,trashed,webViewLink";
+    private const string FileFields = "id,name,parents,mimeType,md5Checksum,size,modifiedTime,trashed,webViewLink,capabilities/canTrash";
 
     private readonly DriveService _service;
 
@@ -221,7 +221,8 @@ public sealed class GoogleDriveProvider : ICloudProvider, IDisposable
             ModifiedTime = f.ModifiedTimeDateTimeOffset,
             MimeType = f.MimeType,
             IsTrashed = f.Trashed ?? false,
-            WebViewLink = f.WebViewLink
+            WebViewLink = f.WebViewLink,
+            CanTrash = f.Capabilities?.CanTrash
         };
     }
 

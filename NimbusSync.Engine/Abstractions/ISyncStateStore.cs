@@ -18,6 +18,7 @@ public interface ISyncStateStore
     Task UpdateChangeTokenAsync(long profileId, string changeToken, CancellationToken ct = default);
 
     // Items
+    Task<SyncItem?> GetItemByIdAsync(long itemId, CancellationToken ct = default);
     Task<SyncItem?> GetItemByPathAsync(long profileId, string relativePath, CancellationToken ct = default);
     Task<SyncItem?> GetItemByRemoteIdAsync(long profileId, string remoteId, CancellationToken ct = default);
     Task<IReadOnlyList<SyncItem>> GetItemsByStatusAsync(long profileId, SyncItemStatus status, CancellationToken ct = default);
@@ -27,6 +28,9 @@ public interface ISyncStateStore
     Task<int> BulkUpsertItemsAsync(IEnumerable<SyncItem> items, CancellationToken ct = default);
     Task DeleteItemAsync(long itemId, CancellationToken ct = default);
     Task<int> DeleteItemsUnderPathAsync(long profileId, string relativeDirPath, CancellationToken ct = default);
+
+    /// <summary>Rename a path and its subtree in place, keeping row ids (and therefore conflict references).</summary>
+    Task<int> RenameItemPathsAsync(long profileId, string fromPath, string toPath, CancellationToken ct = default);
 
     // Conflicts
     Task<IReadOnlyList<SyncConflict>> GetUnresolvedConflictsAsync(long profileId, CancellationToken ct = default);

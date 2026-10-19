@@ -11,8 +11,11 @@ namespace NimbusSync.Engine.Sync;
 /// Correctness properties:
 ///  - Every detected change is verified against the stored baseline before it becomes work,
 ///    so echoes of the engine's own writes are no-ops and the two sides cannot ping-pong.
+///  - Every destructive write (upload-over, trash, move-over, download-over) re-checks the
+///    other side's live state at execution time and raises a conflict instead of clobbering.
 ///  - Planned operations and the new change token are committed in one transaction before
 ///    anything executes, so a crash or API failure never loses work and never skips a token.
+///  - Items in Conflict status are frozen in both directions until the user resolves them.
 ///  - Remote "removed" never deletes local data; remote "trashed" moves local data to
 ///    <c>.nimbus-trash</c> rather than deleting it.
 /// </summary>
@@ -24,6 +27,10 @@ public sealed class SyncEngine : IDisposable
     private readonly ILogger<SyncEngine> _logger;
     private readonly SyncEngineOptions _options;
     private readonly SemaphoreSlim _cycleLock = new(1, 1);
+
+    /// <summary>Folders known to be outside the synced root; avoids a metadata fetch per cycle.</summary>
+    private readonly Dictionary<string, DateTimeOffset> _foreignFolderCache = new();
+    private static readonly TimeSpan ForeignFolderTtl = TimeSpan.FromMinutes(10);
 
     private CancellationTokenSource? _cts;
     private Task? _loop;
@@ -78,6 +85,9 @@ public sealed class SyncEngine : IDisposable
             try { await _loop; } catch (OperationCanceledException) { }
         }
         _loop = null;
+        // Wait for any in-flight locked work (e.g. a conflict resolution) to finish.
+        await _cycleLock.WaitAsync();
+        _cycleLock.Release();
         SetState(SyncEngineState.Stopped);
     }
 
@@ -150,16 +160,26 @@ public sealed class SyncEngine : IDisposable
         var plan = new CyclePlan();
         var matchedLocal = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        // Folders first so parents exist before children.
-        foreach (var r in remoteById.Values.OrderByDescending(r => r.IsFolder))
+        // Folders first (shallowest first) so parents exist before children.
+        var ordered = remoteById.Values
+            .Select(r => (r, path: ResolvePathFromMap(r, remoteById, profile.RemoteFolderId)))
+            .Where(t => t.path is not null && !_exclusions.IsExcluded(t.path!))
+            .OrderByDescending(t => t.r.IsFolder).ThenBy(t => t.path!.Count(c => c == '/'));
+
+        foreach (var (r, rawPath) in ordered)
         {
-            var path = ResolvePathFromMap(r, remoteById, profile.RemoteFolderId);
-            if (path is null || _exclusions.IsExcluded(path)) continue;
+            var path = rawPath!;
 
             if (r.IsFolder)
             {
+                path = await DedupPathAsync(profile, path, r.Id, plan, ct);
+                if (local.TryGetValue(path, out var existingLocal) && existingLocal is FileInfo clashFile)
+                {
+                    await PlanTypeClashAsync(profile, path, clashFile, plan, ct); // local file where a folder must go
+                    local.Remove(path);
+                }
                 matchedLocal.Add(path);
-                plan.Items.Add(NewItem(profile, path, r, isDir: true, SyncItemStatus.Synced));
+                plan.Add(NewItem(profile, path, r, isDir: true, SyncItemStatus.Synced));
                 if (!local.ContainsKey(path))
                     plan.Ops.Add(Op(profile, SyncOperationType.CreateLocalFolder, path, r.Id));
                 continue;
@@ -168,51 +188,55 @@ public sealed class SyncEngine : IDisposable
             if (r.IsGoogleNative)
             {
                 if (profile.NativeFilePolicy == NativeFilePolicy.Skip) continue;
-                var stubPath = path + ".url";
+                var stubPath = await DedupPathAsync(profile, path + ".url", r.Id, plan, ct);
                 matchedLocal.Add(stubPath);
-                plan.Items.Add(NewItem(profile, stubPath, r, isDir: false, SyncItemStatus.Synced, isNative: true));
+                plan.Add(NewItem(profile, stubPath, r, isDir: false, SyncItemStatus.Synced, isNative: true));
                 plan.Ops.Add(Op(profile, SyncOperationType.WriteNativeStub, stubPath, r.Id));
                 continue;
             }
 
+            path = await DedupPathAsync(profile, path, r.Id, plan, ct);
             matchedLocal.Add(path);
+
             if (local.TryGetValue(path, out var localInfo) && localInfo is FileInfo fi)
             {
                 var hash = await FileHasher.ComputeMd5Async(fi.FullName, ct);
-                if (string.Equals(hash, r.Md5Hash, StringComparison.OrdinalIgnoreCase))
-                {
-                    var item = NewItem(profile, path, r, false, SyncItemStatus.Synced);
-                    SetLocalBaseline(item, fi, hash);
-                    plan.Items.Add(item);
-                }
-                else
+                var item = NewItem(profile, path, r, false, SyncItemStatus.Synced);
+                SetLocalBaseline(item, fi, hash);
+                if (!string.Equals(hash, r.Md5Hash, StringComparison.OrdinalIgnoreCase))
                 {
                     // Both sides have content and no baseline exists: the user decides.
-                    var item = NewItem(profile, path, r, false, SyncItemStatus.Conflict);
-                    SetLocalBaseline(item, fi, hash);
-                    plan.Items.Add(item);
+                    item.Status = SyncItemStatus.Conflict;
                     plan.Conflicts.Add(new PlannedConflict(item, hash, r.Md5Hash, fi.Length, r.Size,
                         new DateTimeOffset(fi.LastWriteTimeUtc), r.ModifiedTime));
                 }
+                plan.Add(item);
+            }
+            else if (local.TryGetValue(path, out var localDir) && localDir is DirectoryInfo)
+            {
+                await PlanTypeClashAsync(profile, path, localDir, plan, ct); // local folder where a file must go
+                local.Remove(path);
+                plan.Add(NewItem(profile, path, r, false, SyncItemStatus.RemoteNew));
+                plan.Ops.Add(Op(profile, SyncOperationType.Download, path, r.Id, r.Md5Hash));
             }
             else
             {
-                plan.Items.Add(NewItem(profile, path, r, false, SyncItemStatus.RemoteNew));
+                plan.Add(NewItem(profile, path, r, false, SyncItemStatus.RemoteNew));
                 plan.Ops.Add(Op(profile, SyncOperationType.Download, path, r.Id, r.Md5Hash));
             }
         }
 
         foreach (var (path, info) in local.OrderBy(kv => kv.Key.Count(c => c == '/')))
         {
-            if (matchedLocal.Contains(path)) continue;
+            if (matchedLocal.Contains(path) || plan.HasPath(path)) continue;
             if (info is DirectoryInfo)
             {
-                plan.Items.Add(new SyncItem { ProfileId = profile.Id, RelativePath = path, IsDirectory = true, Status = SyncItemStatus.LocalNew });
+                plan.Add(new SyncItem { ProfileId = profile.Id, RelativePath = path, IsDirectory = true, Status = SyncItemStatus.LocalNew });
                 plan.Ops.Add(Op(profile, SyncOperationType.CreateRemoteFolder, path));
             }
             else
             {
-                plan.Items.Add(new SyncItem { ProfileId = profile.Id, RelativePath = path, Status = SyncItemStatus.LocalNew });
+                plan.Add(new SyncItem { ProfileId = profile.Id, RelativePath = path, Status = SyncItemStatus.LocalNew });
                 plan.Ops.Add(Op(profile, SyncOperationType.Upload, path));
             }
         }
@@ -224,24 +248,46 @@ public sealed class SyncEngine : IDisposable
         await ExecutePendingAsync(profile, ct);
     }
 
+    /// <summary>
+    /// A file sits where the other side has a folder (or vice versa). Preserve the local
+    /// item as a conflict copy, upload it, and record an auto-resolved KeepBoth conflict.
+    /// </summary>
+    private async Task PlanTypeClashAsync(SyncProfile profile, string path, FileSystemInfo localInfo, CyclePlan plan, CancellationToken ct)
+    {
+        var copyPath = ConflictCopyName(path);
+        var from = PathNormalizer.ToAbsolute(profile.LocalRootPath, path);
+        var to = PathNormalizer.ToAbsolute(profile.LocalRootPath, copyPath);
+        if (localInfo is DirectoryInfo) Directory.Move(from, to); else File.Move(from, to);
+        _logger.LogWarning("'{Path}' clashes with a remote item of a different type; kept local copy as '{Copy}'.", path, copyPath);
+
+        var existing = await _store.GetItemByPathAsync(profile.Id, path, ct);
+        if (existing is not null) await _store.DeleteItemsUnderPathAsync(profile.Id, path, ct);
+
+        if (localInfo is DirectoryInfo)
+        {
+            plan.Add(new SyncItem { ProfileId = profile.Id, RelativePath = copyPath, IsDirectory = true, Status = SyncItemStatus.LocalNew });
+            plan.Ops.Add(Op(profile, SyncOperationType.CreateRemoteFolder, copyPath));
+            await EnqueueUntrackedChildrenAsync(profile, copyPath, plan, [], ct);
+        }
+        else
+        {
+            var fi = new FileInfo(to);
+            var item = new SyncItem { ProfileId = profile.Id, RelativePath = copyPath, Status = SyncItemStatus.LocalNew };
+            var hash = await FileHasher.ComputeMd5Async(to, ct);
+            SetLocalBaseline(item, fi, hash);
+            plan.Add(item);
+            plan.Ops.Add(Op(profile, SyncOperationType.Upload, copyPath));
+            plan.Conflicts.Add(new PlannedConflict(item, hash, null, fi.Length, null, new DateTimeOffset(fi.LastWriteTimeUtc), null, AutoResolve: ConflictResolution.KeepBoth));
+        }
+    }
+
     // ------------------------------------------------------------------ cycle
 
     private async Task RunCycleAsync(SyncProfile profile, CancellationToken ct)
     {
         SetState(SyncEngineState.Syncing);
 
-        IReadOnlyList<DetectedChange> localChanges;
-        if (_monitor.NeedsFullRescan)
-        {
-            _logger.LogWarning("File system watcher overflowed; performing full local rescan.");
-            localChanges = await DiffLocalTreeAsync(profile, ct);
-            _monitor.AcknowledgeRescan();
-        }
-        else
-        {
-            localChanges = _monitor.DrainChanges();
-        }
-
+        // Remote first: if the pull fails nothing local has been drained yet.
         var token = profile.ChangeToken ?? throw new InvalidOperationException("No change token; initial scan required.");
         var (rawRemote, newToken) = await _cloud.GetChangesAsync(token, profile.SharedDriveId, ct);
 
@@ -249,19 +295,40 @@ public sealed class SyncEngine : IDisposable
         var remoteByFileId = new Dictionary<string, RemoteChange>();
         foreach (var c in rawRemote) remoteByFileId[c.FileId] = c;
 
+        var rescan = _monitor.NeedsFullRescan;
+        IReadOnlyList<DetectedChange> localChanges;
+        if (rescan)
+        {
+            _logger.LogWarning("File system watcher overflowed; performing full local rescan.");
+            localChanges = await DiffLocalTreeAsync(profile, ct);
+        }
+        else
+        {
+            localChanges = _monitor.DrainChanges();
+        }
+
         if (localChanges.Count > 0 || remoteByFileId.Count > 0)
             _logger.LogInformation("Cycle: {L} local, {R} remote changes", localChanges.Count, remoteByFileId.Count);
 
-        var plan = await PlanAsync(profile, localChanges, remoteByFileId, ct);
-        await CommitPlanAsync(profile, plan, newToken, ct);
-        await ExecutePendingAsync(profile, ct);
+        try
+        {
+            var plan = await PlanAsync(profile, localChanges, remoteByFileId, ct);
+            await CommitPlanAsync(profile, plan, newToken, ct);
+        }
+        catch
+        {
+            if (!rescan) _monitor.Requeue(localChanges); // nothing was committed; do not lose the drained events
+            throw;
+        }
+        if (rescan) _monitor.AcknowledgeRescan();
 
+        await ExecutePendingAsync(profile, ct);
         SetState(SyncEngineState.Watching);
     }
 
     private async Task CommitPlanAsync(SyncProfile profile, CyclePlan plan, string? newToken, CancellationToken ct)
     {
-        ApplyDirectionFilter(profile, plan);
+        ApplyDirectionFilter(profile, plan.Ops);
         await _store.CommitCycleAsync(profile.Id, plan.Items, plan.Ops, newToken, ct);
         if (newToken is not null) profile.ChangeToken = newToken;
 
@@ -269,22 +336,34 @@ public sealed class SyncEngine : IDisposable
         foreach (var dir in plan.SubtreeDeletes) await _store.DeleteItemsUnderPathAsync(profile.Id, dir, ct);
 
         foreach (var pc in plan.Conflicts)
-        {
-            var conflict = new SyncConflict
-            {
-                ProfileId = profile.Id, SyncItemId = pc.Item.Id, RelativePath = pc.Item.RelativePath,
-                LocalHash = pc.LocalHash, RemoteHash = pc.RemoteHash, LocalSize = pc.LocalSize, RemoteSize = pc.RemoteSize,
-                LocalModified = pc.LocalModified, RemoteModified = pc.RemoteModified
-            };
-            await _store.AddConflictAsync(conflict, ct);
-            ConflictDetected?.Invoke(this, conflict);
-        }
+            await RaiseConflictAsync(profile, pc.Item, pc.LocalHash, pc.RemoteHash, pc.LocalSize, pc.RemoteSize,
+                pc.LocalModified, pc.RemoteModified, pc.AutoResolve, ct);
     }
 
-    private static void ApplyDirectionFilter(SyncProfile profile, CyclePlan plan)
+    private async Task RaiseConflictAsync(SyncProfile profile, SyncItem item, string? localHash, string? remoteHash,
+        long? localSize, long? remoteSize, DateTimeOffset? localModified, DateTimeOffset? remoteModified,
+        ConflictResolution? autoResolve, CancellationToken ct)
+    {
+        var conflict = new SyncConflict
+        {
+            ProfileId = profile.Id, SyncItemId = item.Id, RelativePath = item.RelativePath,
+            LocalHash = localHash, RemoteHash = remoteHash, LocalSize = localSize, RemoteSize = remoteSize,
+            LocalModified = localModified, RemoteModified = remoteModified
+        };
+        await _store.AddConflictAsync(conflict, ct);
+        if (autoResolve is { } r)
+        {
+            await _store.ResolveConflictAsync(conflict.Id, r, ct);
+            conflict.Resolution = r;
+            conflict.ResolvedAt = DateTimeOffset.UtcNow;
+        }
+        ConflictDetected?.Invoke(this, conflict);
+    }
+
+    private static void ApplyDirectionFilter(SyncProfile profile, List<PendingOperation> ops)
     {
         if (profile.Direction == SyncDirection.Bidirectional) return;
-        plan.Ops.RemoveAll(op => profile.Direction switch
+        ops.RemoveAll(op => profile.Direction switch
         {
             SyncDirection.LocalToRemote => op.Type is SyncOperationType.Download or SyncOperationType.CreateLocalFolder
                 or SyncOperationType.DeleteLocal or SyncOperationType.MoveLocal or SyncOperationType.WriteNativeStub,
@@ -301,9 +380,11 @@ public sealed class SyncEngine : IDisposable
     {
         var plan = new CyclePlan();
         var consumedRemote = new HashSet<string>();
+        var requeue = new List<DetectedChange>();
 
-        // Pass 1: local deletions, indexed by baseline hash for rename detection.
+        // Pass 1: local deletions, indexed for rename detection.
         var deletedByHash = new Dictionary<string, SyncItem>(StringComparer.OrdinalIgnoreCase);
+        var deletedDirs = new List<SyncItem>();
         var pendingDeletes = new List<SyncItem>();
         var creates = new List<DetectedChange>();
 
@@ -316,14 +397,17 @@ public sealed class SyncEngine : IDisposable
             var item = await _store.GetItemByPathAsync(profile.Id, change.RelativePath, ct);
             if (item is null) continue;
             pendingDeletes.Add(item);
-            if (!item.IsDirectory && item.LastSyncedLocalHash is not null)
-                deletedByHash.TryAdd(item.LastSyncedLocalHash, item);
+            if (item.IsDirectory) deletedDirs.Add(item);
+            else if (item.LastSyncedLocalHash is not null) deletedByHash.TryAdd(item.LastSyncedLocalHash, item);
         }
 
-        // Pass 2: local creates/modifies, verified against baseline.
-        foreach (var change in creates)
+        // Pass 2: local creates/modifies, shallowest first so folder renames are seen before their children.
+        var movedDirs = new List<string>(); // new paths of locally renamed folders; children need no separate work
+        foreach (var change in creates.OrderBy(c => c.RelativePath.Count(ch => ch == '/')))
         {
             var path = change.RelativePath;
+            if (plan.HasPath(path) || movedDirs.Any(d => PathNormalizer.IsUnder(path, d))) continue;
+
             var abs = PathNormalizer.ToAbsolute(profile.LocalRootPath, path);
             var item = await _store.GetItemByPathAsync(profile.Id, path, ct);
 
@@ -333,72 +417,77 @@ public sealed class SyncEngine : IDisposable
             if (Directory.Exists(abs))
             {
                 if (item is not null) continue; // directory "modified" events are noise
-                plan.Items.Add(new SyncItem { ProfileId = profile.Id, RelativePath = path, IsDirectory = true, Status = SyncItemStatus.LocalNew });
-                plan.Ops.Add(Op(profile, SyncOperationType.CreateRemoteFolder, path));
-                await EnqueueUntrackedChildrenAsync(profile, path, plan, ct);
-                continue;
-            }
 
-            var fi = new FileInfo(abs);
-            var hash = await FileHasher.ComputeMd5Async(abs, ct);
-
-            if (item is null)
-            {
-                if (deletedByHash.Remove(hash, out var source) && pendingDeletes.Remove(source))
+                var renamedFrom = await FindRenamedDirectoryAsync(profile, path, deletedDirs, ct);
+                if (renamedFrom is not null)
                 {
-                    // Same content vanished elsewhere in this batch: a rename or move.
-                    plan.Ops.Add(new PendingOperation
-                    {
-                        ProfileId = profile.Id, Type = SyncOperationType.MoveRemote,
-                        RelativePath = source.RelativePath, TargetRelativePath = path, RemoteId = source.RemoteId
-                    });
+                    pendingDeletes.Remove(renamedFrom);
+                    deletedDirs.Remove(renamedFrom);
+                    foreach (var child in await _store.GetItemsUnderPathAsync(profile.Id, renamedFrom.RelativePath, ct))
+                        pendingDeletes.RemoveAll(d => d.Id == child.Id);
+                    plan.Ops.Add(MoveOp(profile, SyncOperationType.MoveRemote, renamedFrom.RelativePath, path, renamedFrom.RemoteId));
+                    movedDirs.Add(path);
                     continue;
                 }
-                var newItem = new SyncItem { ProfileId = profile.Id, RelativePath = path, Status = SyncItemStatus.LocalNew };
-                SetLocalBaseline(newItem, fi, null);
-                plan.Items.Add(newItem);
-                plan.Ops.Add(Op(profile, SyncOperationType.Upload, path));
+
+                plan.Add(new SyncItem { ProfileId = profile.Id, RelativePath = path, IsDirectory = true, Status = SyncItemStatus.LocalNew });
+                plan.Ops.Add(Op(profile, SyncOperationType.CreateRemoteFolder, path));
+                await EnqueueUntrackedChildrenAsync(profile, path, plan, deletedByHash, ct);
                 continue;
             }
 
-            if (string.Equals(hash, item.LastSyncedLocalHash, StringComparison.OrdinalIgnoreCase))
-                continue; // echo of our own download, or a touch with no content change
-
-            var remoteChanged = item.RemoteId is not null
-                && remoteByFileId.TryGetValue(item.RemoteId, out var rc)
-                && rc.Type == RemoteChangeType.Modified && rc.File is { IsTrashed: false }
-                && !string.Equals(rc.File.Md5Hash, item.LastSyncedRemoteHash, StringComparison.OrdinalIgnoreCase);
-
-            if (remoteChanged)
+            try
             {
-                var rf = remoteByFileId[item.RemoteId!].File!;
-                consumedRemote.Add(item.RemoteId!);
-                item.Status = SyncItemStatus.Conflict;
-                plan.Items.Add(item);
-                plan.Conflicts.Add(new PlannedConflict(item, hash, rf.Md5Hash, fi.Length, rf.Size,
-                    new DateTimeOffset(fi.LastWriteTimeUtc), rf.ModifiedTime));
-                continue;
+                await PlanLocalFileAsync(profile, path, item, plan, deletedByHash, pendingDeletes, remoteByFileId, consumedRemote, ct);
             }
-
-            item.Status = SyncItemStatus.LocalModified;
-            plan.Items.Add(item);
-            plan.Ops.Add(Op(profile, SyncOperationType.Upload, path, item.RemoteId));
+            catch (IOException ex)
+            {
+                _logger.LogWarning(ex, "'{Path}' could not be read (locked?); will retry next cycle.", path);
+                requeue.Add(change);
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                _logger.LogWarning(ex, "'{Path}' could not be read (access denied); will retry next cycle.", path);
+                requeue.Add(change);
+            }
         }
+
+        // Sources of detected renames are not deletions.
+        pendingDeletes.RemoveAll(d => plan.MovedSources.Contains(d.Id));
 
         // Pass 3: remaining local deletions.
         foreach (var item in pendingDeletes)
         {
-            if (item.RemoteId is not null && remoteByFileId.TryGetValue(item.RemoteId, out var rc)
-                && rc.Type == RemoteChangeType.Modified && rc.File is { IsTrashed: false, IsFolder: false }
-                && !string.Equals(rc.File.Md5Hash, item.LastSyncedRemoteHash, StringComparison.OrdinalIgnoreCase))
+            if (item.IsDirectory)
+            {
+                var children = await _store.GetItemsUnderPathAsync(profile.Id, item.RelativePath, ct);
+                var protectedChildren = children.Where(c => !c.IsDirectory && (c.Status == SyncItemStatus.Conflict || RemoteContentChanged(c, remoteByFileId))).ToList();
+                if (protectedChildren.Count > 0)
+                {
+                    // A teammate edited something inside: remote wins, restore the folder locally.
+                    _logger.LogWarning("Local delete of '{Dir}' skipped: {N} file(s) inside changed remotely. Restoring.", item.RelativePath, protectedChildren.Count);
+                    plan.Ops.Add(Op(profile, SyncOperationType.CreateLocalFolder, item.RelativePath, item.RemoteId));
+                    foreach (var c in children)
+                    {
+                        if (c.IsDirectory) plan.Ops.Add(Op(profile, SyncOperationType.CreateLocalFolder, c.RelativePath, c.RemoteId));
+                        else if (c.IsGoogleNative) plan.Ops.Add(Op(profile, SyncOperationType.WriteNativeStub, c.RelativePath, c.RemoteId));
+                        else { if (c.RemoteId is not null) consumedRemote.Add(c.RemoteId); plan.Ops.Add(Op(profile, SyncOperationType.Download, c.RelativePath, c.RemoteId)); }
+                    }
+                    continue;
+                }
+            }
+            else if (item.Status == SyncItemStatus.Conflict || RemoteContentChanged(item, remoteByFileId))
             {
                 // Remote edit beats local delete: restore by downloading.
-                consumedRemote.Add(item.RemoteId);
-                plan.Ops.Add(Op(profile, SyncOperationType.Download, item.RelativePath, item.RemoteId, rc.File.Md5Hash));
+                if (item.RemoteId is not null) consumedRemote.Add(item.RemoteId);
+                item.Status = SyncItemStatus.RemoteModified;
+                plan.Add(item);
+                plan.Ops.Add(Op(profile, SyncOperationType.Download, item.RelativePath, item.RemoteId));
                 continue;
             }
+
             item.Status = SyncItemStatus.LocalDeleted;
-            plan.Items.Add(item);
+            plan.Add(item);
             plan.Ops.Add(Op(profile, SyncOperationType.DeleteRemote, item.RelativePath, item.RemoteId));
         }
 
@@ -430,7 +519,7 @@ public sealed class SyncEngine : IDisposable
             var path = await ResolveRemotePathAsync(profile, file, remoteByFileId, pathCache, ct);
             if (path is null)
             {
-                // Moved outside the synced folder.
+                // Moved outside the synced folder (or under a trashed parent).
                 if (item is not null) plan.Ops.Add(Op(profile, SyncOperationType.DeleteLocal, item.RelativePath, fileId));
                 continue;
             }
@@ -440,13 +529,19 @@ public sealed class SyncEngine : IDisposable
                 if (_exclusions.IsExcluded(path)) continue;
                 if (item is null)
                 {
-                    plan.Items.Add(NewItem(profile, path, file, true, SyncItemStatus.RemoteNew));
+                    path = await DedupPathAsync(profile, path, fileId, plan, ct);
+                    var abs = PathNormalizer.ToAbsolute(profile.LocalRootPath, path);
+                    if (File.Exists(abs))
+                    {
+                        await PlanTypeClashAsync(profile, path, new FileInfo(abs), plan, ct);
+                    }
+                    plan.Add(NewItem(profile, path, file, true, SyncItemStatus.RemoteNew));
                     plan.Ops.Add(Op(profile, SyncOperationType.CreateLocalFolder, path, fileId));
                 }
                 else if (!string.Equals(item.RelativePath, path, StringComparison.OrdinalIgnoreCase))
                 {
-                    plan.Ops.Add(new PendingOperation { ProfileId = profile.Id, Type = SyncOperationType.MoveLocal,
-                        RelativePath = item.RelativePath, TargetRelativePath = path, RemoteId = fileId });
+                    path = await DedupPathAsync(profile, path, fileId, plan, ct);
+                    plan.Ops.Add(MoveOp(profile, SyncOperationType.MoveLocal, item.RelativePath, path, fileId));
                 }
                 continue;
             }
@@ -456,13 +551,16 @@ public sealed class SyncEngine : IDisposable
                 if (profile.NativeFilePolicy == NativeFilePolicy.Skip) continue;
                 var stubPath = path + ".url";
                 if (_exclusions.IsExcluded(stubPath)) continue;
-                if (item is not null && !string.Equals(item.RelativePath, stubPath, StringComparison.OrdinalIgnoreCase))
-                    plan.Ops.Add(new PendingOperation { ProfileId = profile.Id, Type = SyncOperationType.MoveLocal,
-                        RelativePath = item.RelativePath, TargetRelativePath = stubPath, RemoteId = fileId });
                 if (item is null)
                 {
-                    plan.Items.Add(NewItem(profile, stubPath, file, false, SyncItemStatus.RemoteNew, isNative: true));
+                    stubPath = await DedupPathAsync(profile, stubPath, fileId, plan, ct);
+                    plan.Add(NewItem(profile, stubPath, file, false, SyncItemStatus.RemoteNew, isNative: true));
                     plan.Ops.Add(Op(profile, SyncOperationType.WriteNativeStub, stubPath, fileId));
+                }
+                else if (!string.Equals(item.RelativePath, stubPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    stubPath = await DedupPathAsync(profile, stubPath, fileId, plan, ct);
+                    plan.Ops.Add(MoveOp(profile, SyncOperationType.MoveLocal, item.RelativePath, stubPath, fileId));
                 }
                 continue;
             }
@@ -471,27 +569,28 @@ public sealed class SyncEngine : IDisposable
 
             if (item is null)
             {
+                path = await DedupPathAsync(profile, path, fileId, plan, ct);
                 var abs = PathNormalizer.ToAbsolute(profile.LocalRootPath, path);
-                if (File.Exists(abs))
+                if (Directory.Exists(abs))
+                {
+                    await PlanTypeClashAsync(profile, path, new DirectoryInfo(abs), plan, ct);
+                }
+                else if (File.Exists(abs))
                 {
                     var localHash = await FileHasher.ComputeMd5Async(abs, ct);
                     var fi = new FileInfo(abs);
                     var newItem = NewItem(profile, path, file, false, SyncItemStatus.Synced);
                     SetLocalBaseline(newItem, fi, localHash);
-                    if (string.Equals(localHash, file.Md5Hash, StringComparison.OrdinalIgnoreCase))
-                    {
-                        plan.Items.Add(newItem); // identical content on both sides: adopt as baseline
-                    }
-                    else
+                    if (!string.Equals(localHash, file.Md5Hash, StringComparison.OrdinalIgnoreCase))
                     {
                         newItem.Status = SyncItemStatus.Conflict;
-                        plan.Items.Add(newItem);
                         plan.Conflicts.Add(new PlannedConflict(newItem, localHash, file.Md5Hash, fi.Length, file.Size,
                             new DateTimeOffset(fi.LastWriteTimeUtc), file.ModifiedTime));
                     }
+                    plan.Add(newItem); // identical content on both sides: adopt as baseline
                     continue;
                 }
-                plan.Items.Add(NewItem(profile, path, file, false, SyncItemStatus.RemoteNew));
+                plan.Add(NewItem(profile, path, file, false, SyncItemStatus.RemoteNew));
                 plan.Ops.Add(Op(profile, SyncOperationType.Download, path, fileId, file.Md5Hash));
                 continue;
             }
@@ -500,48 +599,160 @@ public sealed class SyncEngine : IDisposable
             var contentChanged = !string.Equals(file.Md5Hash, item.LastSyncedRemoteHash, StringComparison.OrdinalIgnoreCase);
 
             if (moved)
-                plan.Ops.Add(new PendingOperation { ProfileId = profile.Id, Type = SyncOperationType.MoveLocal,
-                    RelativePath = item.RelativePath, TargetRelativePath = path, RemoteId = fileId });
-
+            {
+                path = await DedupPathAsync(profile, path, fileId, plan, ct);
+                plan.Ops.Add(MoveOp(profile, SyncOperationType.MoveLocal, item.RelativePath, path, fileId));
+            }
             if (contentChanged)
             {
                 item.Status = SyncItemStatus.RemoteModified;
-                plan.Items.Add(item);
+                plan.Add(item);
                 plan.Ops.Add(Op(profile, SyncOperationType.Download, path, fileId, file.Md5Hash));
             }
             // Neither moved nor changed: this is the echo of our own upload.
         }
 
+        if (requeue.Count > 0) _monitor.Requeue(requeue);
         return plan;
     }
 
-    private async Task EnqueueUntrackedChildrenAsync(SyncProfile profile, string dirPath, CyclePlan plan, CancellationToken ct)
+    private async Task PlanLocalFileAsync(SyncProfile profile, string path, SyncItem? item, CyclePlan plan,
+        Dictionary<string, SyncItem> deletedByHash, List<SyncItem> pendingDeletes,
+        Dictionary<string, RemoteChange> remoteByFileId, HashSet<string> consumedRemote, CancellationToken ct)
+    {
+        var abs = PathNormalizer.ToAbsolute(profile.LocalRootPath, path);
+        var fi = new FileInfo(abs);
+        var hash = await FileHasher.ComputeMd5Async(abs, ct);
+
+        if (item is null)
+        {
+            if (deletedByHash.Remove(hash, out var source) && pendingDeletes.Remove(source))
+            {
+                // Same content vanished elsewhere in this batch: a rename or move.
+                plan.Ops.Add(MoveOp(profile, SyncOperationType.MoveRemote, source.RelativePath, path, source.RemoteId));
+                plan.MarkPath(path);
+                plan.MovedSources.Add(source.Id);
+                return;
+            }
+            var newItem = new SyncItem { ProfileId = profile.Id, RelativePath = path, Status = SyncItemStatus.LocalNew };
+            SetLocalBaseline(newItem, fi, null);
+            plan.Add(newItem);
+            plan.Ops.Add(Op(profile, SyncOperationType.Upload, path));
+            return;
+        }
+
+        if (string.Equals(hash, item.LastSyncedLocalHash, StringComparison.OrdinalIgnoreCase))
+            return; // echo of our own download, or a touch with no content change
+
+        if (item.RemoteId is not null && remoteByFileId.TryGetValue(item.RemoteId, out var rc)
+            && rc.Type == RemoteChangeType.Modified && rc.File is { IsTrashed: false } rf
+            && !string.Equals(rf.Md5Hash, item.LastSyncedRemoteHash, StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(rf.Md5Hash, hash, StringComparison.OrdinalIgnoreCase))
+        {
+            consumedRemote.Add(item.RemoteId);
+            item.Status = SyncItemStatus.Conflict;
+            plan.Add(item);
+            plan.Conflicts.Add(new PlannedConflict(item, hash, rf.Md5Hash, fi.Length, rf.Size,
+                new DateTimeOffset(fi.LastWriteTimeUtc), rf.ModifiedTime));
+            return;
+        }
+
+        item.Status = SyncItemStatus.LocalModified;
+        plan.Add(item);
+        plan.Ops.Add(Op(profile, SyncOperationType.Upload, path, item.RemoteId));
+    }
+
+    private static bool RemoteContentChanged(SyncItem item, Dictionary<string, RemoteChange> batch)
+        => item.RemoteId is not null && batch.TryGetValue(item.RemoteId, out var rc)
+           && rc.Type == RemoteChangeType.Modified && rc.File is { IsTrashed: false, IsFolder: false }
+           && !string.Equals(rc.File.Md5Hash, item.LastSyncedRemoteHash, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// A new local directory is a rename of a deleted tracked directory when every tracked
+    /// file under the old path exists under the new path with its baseline hash.
+    /// </summary>
+    private async Task<SyncItem?> FindRenamedDirectoryAsync(SyncProfile profile, string newPath, List<SyncItem> deletedDirs, CancellationToken ct)
+    {
+        foreach (var candidate in deletedDirs)
+        {
+            var children = (await _store.GetItemsUnderPathAsync(profile.Id, candidate.RelativePath, ct))
+                .Where(c => !c.IsDirectory && c.LastSyncedLocalHash is not null).ToList();
+            if (children.Count == 0) continue;
+
+            var allMatch = true;
+            foreach (var child in children)
+            {
+                var rel = newPath + child.RelativePath[candidate.RelativePath.Length..];
+                var abs = PathNormalizer.ToAbsolute(profile.LocalRootPath, rel);
+                if (!File.Exists(abs)) { allMatch = false; break; }
+                var h = await FileHasher.ComputeMd5Async(abs, ct);
+                if (!string.Equals(h, child.LastSyncedLocalHash, StringComparison.OrdinalIgnoreCase)) { allMatch = false; break; }
+            }
+            if (allMatch) return candidate;
+        }
+        return null;
+    }
+
+    private async Task EnqueueUntrackedChildrenAsync(SyncProfile profile, string dirPath, CyclePlan plan,
+        Dictionary<string, SyncItem> deletedByHash, CancellationToken ct)
     {
         var abs = PathNormalizer.ToAbsolute(profile.LocalRootPath, dirPath);
-        foreach (var entry in Directory.EnumerateFileSystemEntries(abs, "*", SearchOption.AllDirectories))
+        foreach (var entry in Directory.EnumerateFileSystemEntries(abs, "*", SearchOption.AllDirectories)
+                     .OrderBy(e => e.Count(c => c == Path.DirectorySeparatorChar)))
         {
             var rel = PathNormalizer.ToRelative(profile.LocalRootPath, entry);
-            if (_exclusions.IsExcluded(rel)) continue;
+            if (_exclusions.IsExcluded(rel) || plan.HasPath(rel)) continue;
             if (await _store.GetItemByPathAsync(profile.Id, rel, ct) is not null) continue;
-            if (plan.Items.Any(i => string.Equals(i.RelativePath, rel, StringComparison.OrdinalIgnoreCase))) continue;
 
             if (Directory.Exists(entry))
             {
-                plan.Items.Add(new SyncItem { ProfileId = profile.Id, RelativePath = rel, IsDirectory = true, Status = SyncItemStatus.LocalNew });
+                plan.Add(new SyncItem { ProfileId = profile.Id, RelativePath = rel, IsDirectory = true, Status = SyncItemStatus.LocalNew });
                 plan.Ops.Add(Op(profile, SyncOperationType.CreateRemoteFolder, rel));
+                continue;
             }
-            else
+
+            var hash = await FileHasher.ComputeMd5Async(entry, ct);
+            if (deletedByHash.Remove(hash, out var source))
             {
-                plan.Items.Add(new SyncItem { ProfileId = profile.Id, RelativePath = rel, Status = SyncItemStatus.LocalNew });
-                plan.Ops.Add(Op(profile, SyncOperationType.Upload, rel));
+                plan.Ops.Add(MoveOp(profile, SyncOperationType.MoveRemote, source.RelativePath, rel, source.RemoteId));
+                plan.MarkPath(rel);
+                plan.MovedSources.Add(source.Id);
+                continue;
             }
+            var item = new SyncItem { ProfileId = profile.Id, RelativePath = rel, Status = SyncItemStatus.LocalNew };
+            SetLocalBaseline(item, new FileInfo(entry), null);
+            plan.Add(item);
+            plan.Ops.Add(Op(profile, SyncOperationType.Upload, rel));
         }
+    }
+
+    /// <summary>
+    /// Returns a local path not already claimed by a different remote item. Drive allows
+    /// duplicate and case-variant names in one folder; Windows does not.
+    /// </summary>
+    private async Task<string> DedupPathAsync(SyncProfile profile, string desired, string remoteId, CyclePlan plan, CancellationToken ct)
+    {
+        var candidate = desired;
+        for (var n = 1; n < 1000; n++)
+        {
+            var existing = await _store.GetItemByPathAsync(profile.Id, candidate, ct);
+            var planned = plan.ItemAt(candidate);
+            var free = (existing is null || existing.RemoteId == remoteId) && (planned is null || planned.RemoteId == remoteId);
+            if (free) return candidate;
+
+            var dir = PathNormalizer.ParentOf(desired)!;
+            var name = PathNormalizer.NameOf(desired);
+            var ext = Path.GetExtension(name);
+            var stem = Path.GetFileNameWithoutExtension(name);
+            candidate = PathNormalizer.Combine(dir, $"{stem} ({n}){ext}");
+        }
+        throw new InvalidOperationException($"Could not find a free local name for '{desired}'.");
     }
 
     /// <summary>
     /// Builds the relative path of a remote file by walking its parent chain: tracked parent in
     /// state, parent in the same change batch, or a metadata fetch as a last resort.
-    /// Returns null when the chain does not reach the profile's root folder.
+    /// Returns null when the chain does not reach the profile's root folder or crosses a trashed folder.
     /// </summary>
     private async Task<string?> ResolveRemotePathAsync(SyncProfile profile, RemoteFileInfo file,
         Dictionary<string, RemoteChange> batch, Dictionary<string, string?> cache, CancellationToken ct)
@@ -559,21 +770,39 @@ public sealed class SyncEngine : IDisposable
         if (cache.TryGetValue(folderId, out var cached)) return cached;
 
         string? result = null;
-        var tracked = await _store.GetItemByRemoteIdAsync(profile.Id, folderId, ct);
         RemoteFileInfo? info = null;
 
-        if (batch.TryGetValue(folderId, out var change) && change.File is { IsFolder: true, IsTrashed: false })
+        if (batch.TryGetValue(folderId, out var change))
+        {
+            if (change.Type != RemoteChangeType.Modified || change.File is not { IsFolder: true, IsTrashed: false })
+            {
+                cache[folderId] = null; // trashed or removed parent: nothing under it is reachable
+                return null;
+            }
             info = change.File; // batch metadata is fresher than state (folder may have moved)
-        else if (tracked is not null)
+        }
+        else if (await _store.GetItemByRemoteIdAsync(profile.Id, folderId, ct) is { } tracked)
+        {
             result = tracked.RelativePath;
+        }
+        else if (_foreignFolderCache.TryGetValue(folderId, out var seenAt) && DateTimeOffset.UtcNow - seenAt < ForeignFolderTtl)
+        {
+            cache[folderId] = null;
+            return null;
+        }
         else
+        {
             info = await _cloud.GetFileInfoAsync(folderId, ct);
+        }
 
-        if (result is null && info is { ParentId: not null })
+        if (result is null && info is { ParentId: not null, IsTrashed: false })
         {
             var parent = await ResolveFolderPathAsync(profile, info.ParentId, batch, cache, depth + 1, ct);
             result = parent is null ? null : PathNormalizer.Combine(parent, info.Name);
         }
+
+        if (result is null && !batch.ContainsKey(folderId)) _foreignFolderCache[folderId] = DateTimeOffset.UtcNow;
+        else _foreignFolderCache.Remove(folderId);
 
         cache[folderId] = result;
         return result;
@@ -598,8 +827,7 @@ public sealed class SyncEngine : IDisposable
 
     private async Task ExecutePendingAsync(SyncProfile profile, CancellationToken ct)
     {
-        var now = DateTimeOffset.UtcNow;
-        var ops = await _store.GetDueOperationsAsync(profile.Id, now, _options.OperationBatchSize, ct);
+        var ops = await _store.GetDueOperationsAsync(profile.Id, DateTimeOffset.UtcNow, _options.OperationBatchSize, ct);
         foreach (var op in ops)
         {
             ct.ThrowIfCancellationRequested();
@@ -632,7 +860,7 @@ public sealed class SyncEngine : IDisposable
     {
         SyncOperationType.Upload => UploadAsync(p, op, ct),
         SyncOperationType.Download => DownloadAsync(p, op, ct),
-        SyncOperationType.CreateRemoteFolder => EnsureRemoteFolderAsync(p, op.RelativePath, ct),
+        SyncOperationType.CreateRemoteFolder => EnsureRemoteFolderIdAsync(p, op.RelativePath, ct),
         SyncOperationType.CreateLocalFolder => CreateLocalFolderAsync(p, op, ct),
         SyncOperationType.DeleteLocal => DeleteLocalAsync(p, op, ct),
         SyncOperationType.DeleteRemote => DeleteRemoteAsync(p, op, ct),
@@ -649,10 +877,38 @@ public sealed class SyncEngine : IDisposable
 
         var item = await _store.GetItemByPathAsync(profile.Id, op.RelativePath, ct)
                    ?? new SyncItem { ProfileId = profile.Id, RelativePath = op.RelativePath };
-        var parentId = await EnsureRemoteFolderIdAsync(profile, PathNormalizer.ParentOf(op.RelativePath)!, ct);
+        if (item.IsGoogleNative) return;
+        if (item.Status == SyncItemStatus.Conflict) return; // frozen; a later resolution will re-enqueue
 
         var hash = await FileHasher.ComputeMd5Async(abs, ct);
         var fi = new FileInfo(abs);
+
+        // Pre-write check: never overwrite remote content the user has not seen.
+        if (item.RemoteId is not null)
+        {
+            var live = await _cloud.GetFileInfoAsync(item.RemoteId, ct);
+            if (live is null || live.IsTrashed)
+            {
+                item.RemoteId = null; // remote copy is gone; local edit wins and uploads as a new file
+            }
+            else
+            {
+                var expected = item.Status == SyncItemStatus.Pending && op.RemoteHash is not null ? op.RemoteHash : item.LastSyncedRemoteHash;
+                if (!string.Equals(live.Md5Hash, expected, StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(live.Md5Hash, hash, StringComparison.OrdinalIgnoreCase))
+                {
+                    item.Status = SyncItemStatus.Conflict;
+                    SetLocalBaseline(item, fi, item.LastSyncedLocalHash); // keep baseline hash; refresh size/mtime only
+                    await _store.UpsertItemAsync(item, ct);
+                    await RaiseConflictAsync(profile, item, hash, live.Md5Hash, fi.Length, live.Size,
+                        new DateTimeOffset(fi.LastWriteTimeUtc), live.ModifiedTime, null, ct);
+                    _logger.LogWarning("Upload of '{Path}' skipped: remote changed since baseline; conflict raised.", op.RelativePath);
+                    return;
+                }
+            }
+        }
+
+        var parentId = await EnsureRemoteFolderIdAsync(profile, PathNormalizer.ParentOf(op.RelativePath)!, ct);
         RemoteFileInfo result;
         await using (var stream = new FileStream(abs, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 81920, useAsync: true))
         {
@@ -684,10 +940,11 @@ public sealed class SyncEngine : IDisposable
 
         var item = await _store.GetItemByPathAsync(profile.Id, op.RelativePath, ct)
                    ?? new SyncItem { ProfileId = profile.Id, RelativePath = op.RelativePath };
+        if (item.Status == SyncItemStatus.Conflict) return; // frozen
 
-        // Last line of defense against clobbering: if the local file drifted from its baseline
-        // since this download was planned (watcher event not yet drained), it is a conflict.
-        // Status Pending means the engine itself intends this write (conflict resolution).
+        // Pre-write check: if the local file drifted from its baseline since this download was
+        // planned (watcher event not yet drained), it is a conflict. Status Pending means the
+        // engine itself intends this write (conflict resolution).
         if (item.Status != SyncItemStatus.Pending && File.Exists(abs))
         {
             var currentLocal = await FileHasher.ComputeMd5Async(abs, ct);
@@ -697,16 +954,10 @@ public sealed class SyncEngine : IDisposable
             {
                 var fiNow = new FileInfo(abs);
                 item.Status = SyncItemStatus.Conflict;
-                if (item.Id == 0) item.RemoteId = info.Id;
+                item.RemoteId ??= info.Id;
                 await _store.UpsertItemAsync(item, ct);
-                var conflict = new SyncConflict
-                {
-                    ProfileId = profile.Id, SyncItemId = item.Id, RelativePath = item.RelativePath,
-                    LocalHash = currentLocal, RemoteHash = info.Md5Hash, LocalSize = fiNow.Length, RemoteSize = info.Size,
-                    LocalModified = new DateTimeOffset(fiNow.LastWriteTimeUtc), RemoteModified = info.ModifiedTime
-                };
-                await _store.AddConflictAsync(conflict, ct);
-                ConflictDetected?.Invoke(this, conflict);
+                await RaiseConflictAsync(profile, item, currentLocal, info.Md5Hash, fiNow.Length, info.Size,
+                    new DateTimeOffset(fiNow.LastWriteTimeUtc), info.ModifiedTime, null, ct);
                 _logger.LogWarning("Download of '{Path}' skipped: local file changed since baseline; conflict raised.", op.RelativePath);
                 return;
             }
@@ -746,18 +997,17 @@ public sealed class SyncEngine : IDisposable
 
     private async Task CreateLocalFolderAsync(SyncProfile profile, PendingOperation op, CancellationToken ct)
     {
-        Directory.CreateDirectory(PathNormalizer.ToAbsolute(profile.LocalRootPath, op.RelativePath));
+        var abs = PathNormalizer.ToAbsolute(profile.LocalRootPath, op.RelativePath);
+        if (File.Exists(abs)) MoveToTrash(profile, op.RelativePath, "a file blocked a folder of the same name");
+        Directory.CreateDirectory(abs);
         var item = await _store.GetItemByPathAsync(profile.Id, op.RelativePath, ct)
                    ?? new SyncItem { ProfileId = profile.Id, RelativePath = op.RelativePath };
         item.IsDirectory = true;
-        item.RemoteId = op.RemoteId;
+        item.RemoteId ??= op.RemoteId;
         item.Status = SyncItemStatus.Synced;
         item.LastSyncedAt = DateTimeOffset.UtcNow;
         await _store.UpsertItemAsync(item, ct);
     }
-
-    private Task EnsureRemoteFolderAsync(SyncProfile profile, string relativeDir, CancellationToken ct)
-        => EnsureRemoteFolderIdAsync(profile, relativeDir, ct);
 
     private async Task<string> EnsureRemoteFolderIdAsync(SyncProfile profile, string relativeDir, CancellationToken ct)
     {
@@ -780,18 +1030,26 @@ public sealed class SyncEngine : IDisposable
 
     private async Task DeleteLocalAsync(SyncProfile profile, PendingOperation op, CancellationToken ct)
     {
-        var abs = PathNormalizer.ToAbsolute(profile.LocalRootPath, op.RelativePath);
-        if (File.Exists(abs) || Directory.Exists(abs))
-        {
-            var trashRoot = Path.Combine(profile.LocalRootPath, ExclusionMatcher.TrashDirName,
-                DateTimeOffset.UtcNow.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture));
-            var dest = PathNormalizer.ToAbsolute(trashRoot, op.RelativePath);
-            Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
-            if (File.Exists(abs)) File.Move(abs, dest, overwrite: true);
-            else Directory.Move(abs, dest);
-            _logger.LogInformation("Moved '{Path}' to {Trash}", op.RelativePath, ExclusionMatcher.TrashDirName);
-        }
+        MoveToTrash(profile, op.RelativePath, "removed remotely");
         await _store.DeleteItemsUnderPathAsync(profile.Id, op.RelativePath, ct);
+    }
+
+    /// <summary>Soft delete. Never removes user data; a unique destination avoids collisions within a cycle.</summary>
+    private void MoveToTrash(SyncProfile profile, string relativePath, string reason)
+    {
+        var abs = PathNormalizer.ToAbsolute(profile.LocalRootPath, relativePath);
+        if (!File.Exists(abs) && !Directory.Exists(abs)) return;
+
+        var bucket = DateTimeOffset.UtcNow.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture);
+        var trashRoot = Path.Combine(profile.LocalRootPath, ExclusionMatcher.TrashDirName, bucket);
+        var dest = PathNormalizer.ToAbsolute(trashRoot, relativePath);
+        for (var n = 1; File.Exists(dest) || Directory.Exists(dest); n++)
+            dest = PathNormalizer.ToAbsolute(Path.Combine(profile.LocalRootPath, ExclusionMatcher.TrashDirName, $"{bucket}-{n}"), relativePath);
+
+        Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
+        if (File.Exists(abs)) File.Move(abs, dest);
+        else Directory.Move(abs, dest);
+        _logger.LogInformation("Moved '{Path}' to {Trash} ({Reason})", relativePath, ExclusionMatcher.TrashDirName, reason);
     }
 
     private async Task DeleteRemoteAsync(SyncProfile profile, PendingOperation op, CancellationToken ct)
@@ -801,7 +1059,27 @@ public sealed class SyncEngine : IDisposable
         if (remoteId is not null)
         {
             var info = await _cloud.GetFileInfoAsync(remoteId, ct);
-            if (info is { IsTrashed: false }) await _cloud.TrashAsync(remoteId, ct);
+            if (info is { IsTrashed: false })
+            {
+                // Pre-write check: a remote edit since baseline wins over the local delete.
+                if (item is not null && !info.IsFolder
+                    && !string.Equals(info.Md5Hash, item.LastSyncedRemoteHash, StringComparison.OrdinalIgnoreCase))
+                {
+                    _logger.LogWarning("Trash of '{Path}' skipped: remote changed since baseline; restoring it locally.", op.RelativePath);
+                    item.Status = SyncItemStatus.RemoteModified;
+                    await _store.UpsertItemAsync(item, ct);
+                    await DownloadAsync(profile, Op(profile, SyncOperationType.Download, op.RelativePath, remoteId, info.Md5Hash), ct);
+                    return;
+                }
+                if (info.CanTrash == false)
+                {
+                    _logger.LogWarning("Cannot trash '{Path}' remotely (no permission); restoring it locally.", op.RelativePath);
+                    if (info.IsFolder) await CreateLocalFolderAsync(profile, Op(profile, SyncOperationType.CreateLocalFolder, op.RelativePath, remoteId), ct);
+                    else await DownloadAsync(profile, Op(profile, SyncOperationType.Download, op.RelativePath, remoteId, info.Md5Hash), ct);
+                    return;
+                }
+                await _cloud.TrashAsync(remoteId, ct);
+            }
         }
         await _store.DeleteItemsUnderPathAsync(profile.Id, op.RelativePath, ct);
     }
@@ -812,17 +1090,46 @@ public sealed class SyncEngine : IDisposable
         var from = PathNormalizer.ToAbsolute(profile.LocalRootPath, op.RelativePath);
         var to = PathNormalizer.ToAbsolute(profile.LocalRootPath, target);
         Directory.CreateDirectory(Path.GetDirectoryName(to)!);
+        var caseOnly = string.Equals(from, to, StringComparison.OrdinalIgnoreCase) && from != to;
+
+        if (!caseOnly && (File.Exists(to) || Directory.Exists(to)))
+        {
+            var occupant = await _store.GetItemByPathAsync(profile.Id, target, ct);
+            if (Directory.Exists(from) && Directory.Exists(to))
+            {
+                MergeDirectories(from, to); // a child download may have created the destination first
+                await RenameTrackedPathsAsync(profile, op.RelativePath, target, ct);
+                return;
+            }
+            if (occupant is null || occupant.RemoteId != op.RemoteId)
+                MoveToTrash(profile, target, "displaced by a remote rename"); // never overwrite an untracked local item
+        }
 
         if (Directory.Exists(from)) Directory.Move(from, to);
-        else if (File.Exists(from)) File.Move(from, to, overwrite: true);
+        else if (File.Exists(from)) File.Move(from, to, overwrite: caseOnly);
         else if (op.RemoteId is not null && !Directory.Exists(to) && !File.Exists(to))
         {
             // Source is gone; fall back to fetching the content at the new location.
-            await DownloadAsync(profile, new PendingOperation { ProfileId = profile.Id, Type = SyncOperationType.Download, RelativePath = target, RemoteId = op.RemoteId }, ct);
+            await RenameTrackedPathsAsync(profile, op.RelativePath, target, ct);
+            await DownloadAsync(profile, Op(profile, SyncOperationType.Download, target, op.RemoteId), ct);
             return;
         }
 
         await RenameTrackedPathsAsync(profile, op.RelativePath, target, ct);
+    }
+
+    private static void MergeDirectories(string from, string to)
+    {
+        foreach (var entry in Directory.EnumerateFileSystemEntries(from))
+        {
+            var dest = Path.Combine(to, Path.GetFileName(entry));
+            if (Directory.Exists(entry))
+            {
+                if (Directory.Exists(dest)) MergeDirectories(entry, dest); else Directory.Move(entry, dest);
+            }
+            else File.Move(entry, dest, overwrite: true);
+        }
+        Directory.Delete(from, recursive: true);
     }
 
     private async Task MoveRemoteAsync(SyncProfile profile, PendingOperation op, CancellationToken ct)
@@ -832,13 +1139,16 @@ public sealed class SyncEngine : IDisposable
         var remoteId = item?.RemoteId ?? op.RemoteId;
         if (remoteId is null) return;
 
+        var live = await _cloud.GetFileInfoAsync(remoteId, ct);
+        if (live is null || live.IsTrashed) { await _store.DeleteItemsUnderPathAsync(profile.Id, op.RelativePath, ct); return; }
+
         var newParentId = await EnsureRemoteFolderIdAsync(profile, PathNormalizer.ParentOf(target)!, ct);
-        var oldParentId = item?.RemoteParentId;
+        var oldParentId = live.ParentId ?? item?.RemoteParentId;
         var newName = PathNormalizer.NameOf(target);
         var sameParent = oldParentId is null || oldParentId == newParentId;
 
         var result = await _cloud.MoveAsync(remoteId,
-            newName == PathNormalizer.NameOf(op.RelativePath) ? null : newName,
+            newName == live.Name ? null : newName,
             sameParent ? null : oldParentId,
             sameParent ? null : newParentId, ct);
 
@@ -860,13 +1170,16 @@ public sealed class SyncEngine : IDisposable
 
         var abs = PathNormalizer.ToAbsolute(profile.LocalRootPath, op.RelativePath);
         Directory.CreateDirectory(Path.GetDirectoryName(abs)!);
+        var item = await _store.GetItemByPathAsync(profile.Id, op.RelativePath, ct);
+        if (item is null && (File.Exists(abs) || Directory.Exists(abs)))
+            MoveToTrash(profile, op.RelativePath, "displaced by a link stub");
+
         var content = $"[InternetShortcut]\r\nURL={info.WebViewLink}\r\n";
         var tmp = abs + ExclusionMatcher.TempSuffix;
         await File.WriteAllTextAsync(tmp, content, ct);
         File.Move(tmp, abs, overwrite: true);
 
-        var item = await _store.GetItemByPathAsync(profile.Id, op.RelativePath, ct)
-                   ?? new SyncItem { ProfileId = profile.Id, RelativePath = op.RelativePath };
+        item ??= new SyncItem { ProfileId = profile.Id, RelativePath = op.RelativePath };
         item.IsGoogleNative = true;
         item.RemoteId = info.Id;
         item.RemoteParentId = info.ParentId;
@@ -877,41 +1190,27 @@ public sealed class SyncEngine : IDisposable
         await _store.UpsertItemAsync(item, ct);
     }
 
-    private async Task RenameTrackedPathsAsync(SyncProfile profile, string from, string to, CancellationToken ct)
-    {
-        var item = await _store.GetItemByPathAsync(profile.Id, from, ct);
-        if (item is null) return;
-
-        if (item.IsDirectory)
-        {
-            foreach (var child in await _store.GetItemsUnderPathAsync(profile.Id, from, ct))
-            {
-                await _store.DeleteItemAsync(child.Id, ct);
-                child.Id = 0;
-                child.RelativePath = to + child.RelativePath[from.Length..];
-                await _store.UpsertItemAsync(child, ct);
-            }
-        }
-        await _store.DeleteItemAsync(item.Id, ct);
-        item.Id = 0;
-        item.RelativePath = to;
-        await _store.UpsertItemAsync(item, ct);
-    }
+    private Task RenameTrackedPathsAsync(SyncProfile profile, string from, string to, CancellationToken ct)
+        => _store.RenameItemPathsAsync(profile.Id, from, to, ct); // in place: row ids and conflict references survive
 
     // ------------------------------------------------------------------ conflicts
 
-    public async Task ResolveConflictAsync(long conflictId, ConflictResolution resolution, CancellationToken ct = default)
+    public Task ResolveConflictAsync(long conflictId, ConflictResolution resolution, CancellationToken ct = default)
+        => RunLockedAsync(() => ResolveConflictCoreAsync(conflictId, resolution, ct), ct);
+
+    private async Task ResolveConflictCoreAsync(long conflictId, ConflictResolution resolution, CancellationToken ct)
     {
         var profile = _profile ?? throw new InvalidOperationException("No active profile.");
         var conflict = await _store.GetConflictAsync(conflictId, ct) ?? throw new KeyNotFoundException($"Conflict {conflictId}");
-        var item = await _store.GetItemByPathAsync(profile.Id, conflict.RelativePath, ct)
+        var item = await _store.GetItemByIdAsync(conflict.SyncItemId, ct)
+                   ?? await _store.GetItemByPathAsync(profile.Id, conflict.RelativePath, ct)
                    ?? throw new InvalidOperationException($"No sync item for '{conflict.RelativePath}'.");
 
         var ops = new List<PendingOperation>();
         switch (resolution)
         {
             case ConflictResolution.KeepLocal:
-                ops.Add(Op(profile, SyncOperationType.Upload, item.RelativePath, item.RemoteId));
+                ops.Add(Op(profile, SyncOperationType.Upload, item.RelativePath, item.RemoteId, conflict.RemoteHash));
                 break;
 
             case ConflictResolution.KeepRemote:
@@ -928,11 +1227,12 @@ public sealed class SyncEngine : IDisposable
                 break;
         }
 
+        ApplyDirectionFilter(profile, ops);
         item.Status = SyncItemStatus.Pending;
         await _store.UpsertItemAsync(item, ct);
         await _store.EnqueueOperationsAsync(ops, ct);
         await _store.ResolveConflictAsync(conflictId, resolution, ct);
-        await RunLockedAsync(() => ExecutePendingAsync(profile, ct), ct);
+        await ExecutePendingAsync(profile, ct);
         _logger.LogInformation("Conflict on '{Path}' resolved: {Resolution}", item.RelativePath, resolution);
     }
 
@@ -981,6 +1281,7 @@ public sealed class SyncEngine : IDisposable
         foreach (var item in tracked)
         {
             trackedPaths.Add(item.RelativePath);
+            if (item.LastSyncedAt is null) continue; // never completed a sync; its absence on disk is expected
             if (!local.TryGetValue(item.RelativePath, out var info))
             {
                 changes.Add(new DetectedChange { RelativePath = item.RelativePath, Type = ChangeType.Deleted });
@@ -1018,6 +1319,9 @@ public sealed class SyncEngine : IDisposable
     private static PendingOperation Op(SyncProfile p, SyncOperationType type, string path, string? remoteId = null, string? remoteHash = null)
         => new() { ProfileId = p.Id, Type = type, RelativePath = path, RemoteId = remoteId, RemoteHash = remoteHash };
 
+    private static PendingOperation MoveOp(SyncProfile p, SyncOperationType type, string from, string to, string? remoteId)
+        => new() { ProfileId = p.Id, Type = type, RelativePath = from, TargetRelativePath = to, RemoteId = remoteId };
+
     private void SetState(SyncEngineState state)
     {
         State = state;
@@ -1036,15 +1340,25 @@ public sealed class SyncEngine : IDisposable
 
     private sealed class CyclePlan
     {
+        private readonly Dictionary<string, SyncItem> _byPath = new(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _claimed = new(StringComparer.OrdinalIgnoreCase);
+
         public List<SyncItem> Items { get; } = [];
         public List<PendingOperation> Ops { get; } = [];
         public List<PlannedConflict> Conflicts { get; } = [];
         public List<long> ItemDeletes { get; } = [];
         public List<string> SubtreeDeletes { get; } = [];
+        public HashSet<long> MovedSources { get; } = [];
+
+        public void Add(SyncItem item) { Items.Add(item); _byPath[item.RelativePath] = item; _claimed.Add(item.RelativePath); }
+        public void MarkPath(string path) => _claimed.Add(path);
+        public bool HasPath(string path) => _claimed.Contains(path);
+        public SyncItem? ItemAt(string path) => _byPath.GetValueOrDefault(path);
     }
 
     private sealed record PlannedConflict(SyncItem Item, string? LocalHash, string? RemoteHash,
-        long? LocalSize, long? RemoteSize, DateTimeOffset? LocalModified, DateTimeOffset? RemoteModified);
+        long? LocalSize, long? RemoteSize, DateTimeOffset? LocalModified, DateTimeOffset? RemoteModified,
+        ConflictResolution? AutoResolve = null);
 }
 
 public enum SyncEngineState { Stopped, InitialScan, Watching, Syncing, Error }

@@ -37,7 +37,7 @@ NimbusSync.Tests/    xUnit. Fakes/ holds an in-memory cloud with a Drive-like ch
 
 ```bash
 dotnet build            # Engine + Tests + App (App compiles cross-platform via EnableWindowsTargeting)
-dotnet test             # 70 tests; the one real-OS-watcher test self-skips off Windows
+dotnet test             # 97 tests; the one real-OS-watcher test self-skips off Windows
 ```
 
 ## Google Cloud setup
@@ -46,11 +46,30 @@ dotnet test             # 70 tests; the one real-OS-watcher test self-skips off 
 2. OAuth consent screen → create a **Desktop app** OAuth client.
 3. Pass client ID/secret to `GoogleDriveProvider.CreateAsync`; the refresh token is stored via `FileDataStore`.
 
+## Pre-write checks (both directions)
+
+Every destructive operation re-checks the other side at execution time, not only at planning time:
+
+| Operation | Check | On mismatch |
+|---|---|---|
+| Upload over existing remote | live `md5Checksum` vs `LastSyncedRemoteHash` (or the conflict's recorded hash when resolving) | conflict |
+| Download over existing local | current local MD5 vs `LastSyncedLocalHash` | conflict |
+| Trash remote | live `md5Checksum` vs baseline; `capabilities.canTrash` | restore locally instead |
+| Trash remote folder | any tracked child edited remotely or in conflict | restore folder locally instead |
+| Move local over an occupied path | occupant tracked as the same remote item? | occupant goes to `.nimbus-trash` |
+
+Items in `Conflict` status are frozen in both directions until resolved. Outbox operations execute in dependency order (folder creates, then moves, then deletes, then transfers) regardless of enqueue order.
+
+Drive allows duplicate and case-variant names in one folder; Windows does not. The second item gets a `name (1).ext` local path, and the state store's path column is `COLLATE NOCASE` so lookups and the UNIQUE constraint agree. A local file sitting where a remote folder must go (or vice versa) is preserved as a conflict copy, uploaded, and recorded as an auto-resolved KeepBoth conflict.
+
 ## Known limitations (v1)
 
-- A renamed file is detected only when the delete and create land in the same cycle; otherwise it re-uploads.
+- Rename detection pairs a delete and a create by content hash within one cycle (files) or by matching all tracked children (folders). Across cycles, a rename re-uploads.
+- A case-only rename on Windows (`Report.txt` to `report.txt`) is coalesced by the case-insensitive watcher and never propagated.
 - `EnsureRemoteFolder` creates a folder without first checking for an untracked same-named remote folder.
-- Google-native files are link stubs only; no export to Office formats.
+- Google-native files are link stubs only; no export to Office formats. Drive shortcuts are treated as ordinary files and will fail to download.
+- `changes.list` scoped to a Shared Drive returns every change in that drive, not only under `RemoteFolderId`. Folders outside the synced root are cached as foreign for 10 minutes to limit metadata fetches.
+- Between a user choosing "Keep remote" and the download executing, a local edit in that window is overwritten (the item is in `Pending` status, which bypasses the drift check).
 - Engine events fire on background threads; the WPF layer must marshal to the dispatcher.
 - 403 `userRateLimitExceeded` relies on the outbox backoff rather than header-driven throttling.
 

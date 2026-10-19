@@ -68,7 +68,7 @@ public sealed class SqliteSyncStateStore : ISyncStateStore
             CREATE TABLE IF NOT EXISTS SyncItems (
                 Id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ProfileId INTEGER NOT NULL REFERENCES SyncProfiles(Id) ON DELETE CASCADE,
-                RelativePath TEXT NOT NULL,
+                RelativePath TEXT NOT NULL COLLATE NOCASE,
                 RemoteId TEXT,
                 RemoteParentId TEXT,
                 IsDirectory INTEGER NOT NULL DEFAULT 0,
@@ -259,6 +259,34 @@ public sealed class SqliteSyncStateStore : ISyncStateStore
             new { profileId, dir = relativeDirPath, pattern = EscapeLike(relativeDirPath + "/") + "%" });
     }
 
+    public async Task<SyncItem?> GetItemByIdAsync(long itemId, CancellationToken ct = default)
+    {
+        await using var db = await OpenAsync(ct);
+        return await db.QuerySingleOrDefaultAsync<SyncItem>("SELECT * FROM SyncItems WHERE Id=@itemId", new { itemId });
+    }
+
+    /// <summary>
+    /// Rename a tracked path and everything under it in place, preserving row ids so
+    /// conflicts referencing those rows survive. One transaction, deepest paths first.
+    /// </summary>
+    public async Task<int> RenameItemPathsAsync(long profileId, string fromPath, string toPath, CancellationToken ct = default)
+    {
+        await using var db = await OpenAsync(ct);
+        await using var tx = await db.BeginTransactionAsync(ct);
+        var prefixLen = fromPath.Length;
+        var n = await db.ExecuteAsync("""
+            UPDATE SyncItems SET RelativePath = @toPath || substr(RelativePath, @prefixLen + 1)
+            WHERE ProfileId=@profileId AND (RelativePath=@fromPath OR RelativePath LIKE @pattern ESCAPE '\')
+            """, new { profileId, fromPath, toPath, prefixLen, pattern = EscapeLike(fromPath + "/") + "%" }, tx);
+        await db.ExecuteAsync("""
+            UPDATE SyncConflicts SET RelativePath = @toPath || substr(RelativePath, @prefixLen + 1)
+            WHERE ProfileId=@profileId AND Resolution IS NULL
+              AND (RelativePath=@fromPath COLLATE NOCASE OR RelativePath LIKE @pattern ESCAPE '\' COLLATE NOCASE)
+            """, new { profileId, fromPath, toPath, prefixLen, pattern = EscapeLike(fromPath + "/") + "%" }, tx);
+        await tx.CommitAsync(ct);
+        return n;
+    }
+
     // ---------------- Conflicts ----------------
 
     public async Task<IReadOnlyList<SyncConflict>> GetUnresolvedConflictsAsync(long profileId, CancellationToken ct = default)
@@ -316,7 +344,15 @@ public sealed class SqliteSyncStateStore : ISyncStateStore
     {
         await using var db = await OpenAsync(ct);
         return (await db.QueryAsync<PendingOperation>(
-            "SELECT * FROM PendingOperations WHERE ProfileId=@profileId AND NextAttemptAt<=@now ORDER BY Id LIMIT @limit",
+            """
+            SELECT * FROM PendingOperations WHERE ProfileId=@profileId AND NextAttemptAt<=@now
+            ORDER BY CASE Type
+                WHEN 2 THEN 0 WHEN 3 THEN 0   -- CreateRemoteFolder, CreateLocalFolder
+                WHEN 6 THEN 1 WHEN 7 THEN 1   -- MoveLocal, MoveRemote
+                WHEN 4 THEN 2 WHEN 5 THEN 2   -- DeleteLocal, DeleteRemote
+                ELSE 3 END, Id
+            LIMIT @limit
+            """,
             new { profileId, now = now.ToString("o"), limit })).ToList();
     }
 

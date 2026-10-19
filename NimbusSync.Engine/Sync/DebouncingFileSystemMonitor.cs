@@ -70,6 +70,11 @@ public sealed class DebouncingFileSystemMonitor : IFileSystemMonitor
         return ready;
     }
 
+    public void Requeue(IEnumerable<DetectedChange> changes)
+    {
+        foreach (var c in changes) Inject(c.RelativePath, c.Type);
+    }
+
     /// <summary>Test hook and manual-scan hook: queue a change as if the watcher saw it.</summary>
     public void Inject(string relativePath, ChangeType type)
         => _pending[relativePath] = new PendingChange(relativePath, type, DateTimeOffset.UtcNow - _debounce);

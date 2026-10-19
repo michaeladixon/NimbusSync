@@ -101,7 +101,8 @@ public sealed class FakeCloudProvider : ICloudProvider
         Size = e.IsFolder || e.IsNative ? null : e.Content.Length,
         ModifiedTime = e.Modified, IsTrashed = e.Trashed,
         MimeType = e.IsFolder ? "application/vnd.google-apps.folder" : e.IsNative ? "application/vnd.google-apps.document" : "application/octet-stream",
-        WebViewLink = e.IsNative ? $"https://docs.google.com/document/d/{e.Id}" : null
+        WebViewLink = e.IsNative ? $"https://docs.google.com/document/d/{e.Id}" : null,
+        CanTrash = true
     };
 
     // ---- ICloudProvider ----

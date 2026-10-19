@@ -19,6 +19,9 @@ public interface IFileSystemMonitor : IDisposable
     /// </summary>
     IReadOnlyList<DetectedChange> DrainChanges();
 
+    /// <summary>Put drained changes back (for example after a failed cycle) so they are not lost.</summary>
+    void Requeue(IEnumerable<DetectedChange> changes);
+
     /// <summary>
     /// Set when the OS event buffer overflowed and events were lost. The engine
     /// must perform a full local scan, then call <see cref="AcknowledgeRescan"/>.
