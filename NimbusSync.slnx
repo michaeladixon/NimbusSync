@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="NimbusSync.App/NimbusSync.App.csproj" />
+  <Project Path="NimbusSync.Engine/NimbusSync.Engine.csproj" />
+  <Project Path="NimbusSync.Tests/NimbusSync.Tests.csproj" />
+</Solution>
