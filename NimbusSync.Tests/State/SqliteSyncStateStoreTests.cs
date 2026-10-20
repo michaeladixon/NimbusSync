@@ -109,6 +109,71 @@ public class SqliteSyncStateStoreTests : IDisposable
         Assert.Equal(["dir2/c.txt", "dirx.txt"], remaining);
     }
 
+    // B2: DeleteItemsUnderPathAsync and GetItemsUnderPathAsync treat the root ("") path
+    // differently. GetItemsUnderPathAsync special-cases "" (prefix = ""), but the delete
+    // builds pattern = EscapeLike("" + "/") + "%" = "/%", which matches nothing, and
+    // RelativePath="" matches no row. So a root-level delete silently leaves descendants.
+    [Fact]
+    public async Task DeleteSubtree_AtRoot_ClearsAllRows()
+    {
+        var pid = await NewProfileAsync();
+        await _store.UpsertItemAsync(new SyncItem { ProfileId = pid, RelativePath = "a.txt" });
+        await _store.UpsertItemAsync(new SyncItem { ProfileId = pid, RelativePath = "b/c.txt" });
+        await _store.UpsertItemAsync(new SyncItem { ProfileId = pid, RelativePath = "top" });
+
+        var deleted = await _store.DeleteItemsUnderPathAsync(pid, "");
+
+        Assert.Equal(3, deleted);
+        Assert.Empty(await _store.GetAllItemsAsync(pid));
+    }
+
+    // B1a: RenameItemPathsAsync uses RelativePath=@fromPath (no COLLATE NOCASE) in the
+    // SyncItems WHERE clause, while the parallel SyncConflicts update does use
+    // COLLATE NOCASE. A fromPath that differs only by case from the stored row name
+    // renames the item in one statement and is skipped in the other, diverging them.
+    [Fact]
+    public async Task RenamePath_ItemAndConflictStayInSync_AcrossCase()
+    {
+        var pid = await NewProfileAsync();
+        // Stored as mixed case; the column is COLLATE NOCASE so lookups are case-insensitive,
+        // but the rename's item UPDATE must also be, or it will miss the row.
+        await _store.UpsertItemAsync(new SyncItem { ProfileId = pid, RelativePath = "Docs", RemoteId = "rDir" });
+        await _store.UpsertItemAsync(new SyncItem { ProfileId = pid, RelativePath = "Docs/inner.txt", RemoteId = "rInner" });
+        var itemId = (await _store.GetItemByPathAsync(pid, "docs/inner.txt"))!.Id;
+        await _store.AddConflictAsync(new SyncConflict { ProfileId = pid, SyncItemId = itemId, RelativePath = "Docs/inner.txt" });
+
+        // Rename using a different case than what is stored on disk.
+        var n = await _store.RenameItemPathsAsync(pid, "docs", "renamed");
+
+        var renamedItem = await _store.GetItemByPathAsync(pid, "renamed/inner.txt");
+        var itemStillAtOldPath = await _store.GetItemByPathAsync(pid, "Docs/inner.txt");
+        var conflict = (await _store.GetUnresolvedConflictsAsync(pid)).Single();
+
+        // The item row MUST have moved (item and conflict must never diverge).
+        Assert.NotNull(renamedItem);
+        Assert.Null(itemStillAtOldPath);
+        Assert.Equal("renamed/inner.txt", conflict.RelativePath);
+        Assert.True(n > 0);
+    }
+
+    // B1b: RenameItemPathsAsync computes substr(RelativePath, fromPath.Length + 1).
+    // fromPath.Length is UTF-16 code units; an emoji is 2 units. SQLite substr indexes
+    // by character, so the slice start is off by one and the rename corrupts the tail.
+    [Fact]
+    public async Task RenamePath_PreservesSurrogatePairInFromPath()
+    {
+        var pid = await NewProfileAsync();
+        const string emojiDir = "\U0001F4E3"; // 📣, 2 UTF-16 units
+        await _store.UpsertItemAsync(new SyncItem { ProfileId = pid, RelativePath = emojiDir });
+        await _store.UpsertItemAsync(new SyncItem { ProfileId = pid, RelativePath = emojiDir + "/note.txt" });
+
+        var n = await _store.RenameItemPathsAsync(pid, emojiDir, "box");
+        Assert.Equal(2, n);
+        Assert.NotNull(await _store.GetItemByPathAsync(pid, "box"));
+        Assert.NotNull(await _store.GetItemByPathAsync(pid, "box/note.txt"));
+        Assert.DoesNotContain(await _store.GetAllItemsAsync(pid), i => !i.RelativePath.StartsWith("box"));
+    }
+
     [Fact]
     public async Task BulkUpsert_IsTransactionalAndIdempotent()
     {
