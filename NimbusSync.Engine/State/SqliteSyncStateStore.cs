@@ -280,21 +280,18 @@ public sealed class SqliteSyncStateStore : ISyncStateStore
         await using var tx = await db.BeginTransactionAsync(ct);
         // The dir row (RelativePath=@fromPath) is matched by the equality branch and gets
         // @toPath directly, so substr() never sees it. For the children, RelativePath =
-        // fromPath + "/" + tail. SQLite's substr() indexes by Unicode character (code point),
-        // not UTF-16 code unit, so a surrogate pair (e.g. emoji) counts as 1, not 2.
-        // We must therefore pass the character length of fromPath, not string.Length.
-        // Each high surrogate starts a 2-unit pair that is 1 character, so subtract the
-        // count of high surrogates from the unit length to get the character length.
-        var prefixLen = fromPath.Length - fromPath.Count(c => char.IsHighSurrogate(c));
+        // fromPath + "/" + tail. substr() indexes by character, not UTF-16 code unit, so the
+        // cut point is length(@fromPath) as SQLite measures the bound parameter: that counts it
+        // exactly as it was stored (a surrogate pair as 1, an unpaired surrogate as U+FFFD).
         var n = await db.ExecuteAsync("""
-            UPDATE SyncItems SET RelativePath = @toPath || substr(RelativePath, @prefixLen + 1)
+            UPDATE SyncItems SET RelativePath = @toPath || substr(RelativePath, length(@fromPath) + 1)
             WHERE ProfileId=@profileId AND (RelativePath=@fromPath OR RelativePath LIKE @pattern ESCAPE '\')
-            """, new { profileId, fromPath, toPath, prefixLen, pattern = EscapeLike(fromPath + "/") + "%" }, tx);
+            """, new { profileId, fromPath, toPath, pattern = EscapeLike(fromPath + "/") + "%" }, tx);
         await db.ExecuteAsync("""
-            UPDATE SyncConflicts SET RelativePath = @toPath || substr(RelativePath, @prefixLen + 1)
+            UPDATE SyncConflicts SET RelativePath = @toPath || substr(RelativePath, length(@fromPath) + 1)
             WHERE ProfileId=@profileId AND Resolution IS NULL
               AND (RelativePath=@fromPath COLLATE NOCASE OR RelativePath LIKE @pattern ESCAPE '\' COLLATE NOCASE)
-            """, new { profileId, fromPath, toPath, prefixLen, pattern = EscapeLike(fromPath + "/") + "%" }, tx);
+            """, new { profileId, fromPath, toPath, pattern = EscapeLike(fromPath + "/") + "%" }, tx);
         await tx.CommitAsync(ct);
         return n;
     }

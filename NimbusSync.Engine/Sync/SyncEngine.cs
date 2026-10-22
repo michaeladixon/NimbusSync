@@ -94,6 +94,11 @@ public sealed class SyncEngine : IDisposable
     /// <summary>One full cycle (initial scan if needed). Used by tests and manual "Sync now".</summary>
     public async Task RunOnceAsync(SyncProfile profile, CancellationToken ct = default)
     {
+        // While the engine is running, StopAsync must be able to cancel a manual cycle
+        // instead of waiting for it on the cycle lock.
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct,
+            State != SyncEngineState.Stopped && _cts is { } running ? running.Token : CancellationToken.None);
+        ct = linked.Token;
         await PrepareProfileAsync(profile, ct);
         await RunLockedAsync(async () =>
         {
@@ -261,7 +266,7 @@ public sealed class SyncEngine : IDisposable
         _logger.LogWarning("'{Path}' clashes with a remote item of a different type; kept local copy as '{Copy}'.", path, copyPath);
 
         var existing = await _store.GetItemByPathAsync(profile.Id, path, ct);
-        if (existing is not null) await _store.DeleteItemsUnderPathAsync(profile.Id, path, ct);
+        if (existing is not null) await ForgetSubtreeAsync(profile, path, ct);
 
         if (localInfo is DirectoryInfo)
         {
@@ -333,7 +338,7 @@ public sealed class SyncEngine : IDisposable
         if (newToken is not null) profile.ChangeToken = newToken;
 
         foreach (var id in plan.ItemDeletes) await _store.DeleteItemAsync(id, ct);
-        foreach (var dir in plan.SubtreeDeletes) await _store.DeleteItemsUnderPathAsync(profile.Id, dir, ct);
+        foreach (var dir in plan.SubtreeDeletes) await ForgetSubtreeAsync(profile, dir, ct);
 
         foreach (var pc in plan.Conflicts)
             await RaiseConflictAsync(profile, pc.Item, pc.LocalHash, pc.RemoteHash, pc.LocalSize, pc.RemoteSize,
@@ -856,7 +861,16 @@ public sealed class SyncEngine : IDisposable
         }
     }
 
-    private Task ExecuteAsync(SyncProfile p, PendingOperation op, CancellationToken ct) => op.Type switch
+    private Task ExecuteAsync(SyncProfile p, PendingOperation op, CancellationToken ct)
+    {
+        // A delete or move of "" would act on the whole synced folder; the root is never a valid target.
+        if (string.IsNullOrEmpty(op.RelativePath) && op.Type is SyncOperationType.DeleteLocal or SyncOperationType.DeleteRemote
+                or SyncOperationType.MoveLocal or SyncOperationType.MoveRemote)
+            throw new InvalidOperationException($"{op.Type} has no path; refusing to act on the sync root.");
+        return ExecuteCoreAsync(p, op, ct);
+    }
+
+    private Task ExecuteCoreAsync(SyncProfile p, PendingOperation op, CancellationToken ct) => op.Type switch
     {
         SyncOperationType.Upload => UploadAsync(p, op, ct),
         SyncOperationType.Download => DownloadAsync(p, op, ct),
@@ -1031,7 +1045,18 @@ public sealed class SyncEngine : IDisposable
     private async Task DeleteLocalAsync(SyncProfile profile, PendingOperation op, CancellationToken ct)
     {
         MoveToTrash(profile, op.RelativePath, "removed remotely");
-        await _store.DeleteItemsUnderPathAsync(profile.Id, op.RelativePath, ct);
+        await ForgetSubtreeAsync(profile, op.RelativePath, ct);
+    }
+
+    /// <summary>
+    /// Drops the tracked rows for a path and everything under it. The store reads "" as the whole
+    /// profile, which would erase every baseline and conflict, so the root is refused here.
+    /// </summary>
+    private Task<int> ForgetSubtreeAsync(SyncProfile profile, string relativePath, CancellationToken ct)
+    {
+        if (string.IsNullOrEmpty(relativePath))
+            throw new InvalidOperationException("Refusing to forget the tracked state of the whole sync root.");
+        return _store.DeleteItemsUnderPathAsync(profile.Id, relativePath, ct);
     }
 
     /// <summary>Soft delete. Never removes user data; a unique destination avoids collisions within a cycle.</summary>
@@ -1081,7 +1106,7 @@ public sealed class SyncEngine : IDisposable
                 await _cloud.TrashAsync(remoteId, ct);
             }
         }
-        await _store.DeleteItemsUnderPathAsync(profile.Id, op.RelativePath, ct);
+        await ForgetSubtreeAsync(profile, op.RelativePath, ct);
     }
 
     private async Task MoveLocalAsync(SyncProfile profile, PendingOperation op, CancellationToken ct)
@@ -1140,7 +1165,7 @@ public sealed class SyncEngine : IDisposable
         if (remoteId is null) return;
 
         var live = await _cloud.GetFileInfoAsync(remoteId, ct);
-        if (live is null || live.IsTrashed) { await _store.DeleteItemsUnderPathAsync(profile.Id, op.RelativePath, ct); return; }
+        if (live is null || live.IsTrashed) { await ForgetSubtreeAsync(profile, op.RelativePath, ct); return; }
 
         var newParentId = await EnsureRemoteFolderIdAsync(profile, PathNormalizer.ParentOf(target)!, ct);
         var oldParentId = live.ParentId ?? item?.RemoteParentId;

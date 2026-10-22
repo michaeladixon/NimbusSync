@@ -175,6 +175,20 @@ public class SqliteSyncStateStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task RenamePath_HandlesUnpairedSurrogateInFromPath()
+    {
+        var pid = await NewProfileAsync();
+        const string oddDir = "X\uD83D"; // NTFS allows a lone high surrogate; SQLite stores it as U+FFFD
+        await _store.UpsertItemAsync(new SyncItem { ProfileId = pid, RelativePath = oddDir });
+        await _store.UpsertItemAsync(new SyncItem { ProfileId = pid, RelativePath = oddDir + "/note.txt" });
+
+        var n = await _store.RenameItemPathsAsync(pid, oddDir, "box");
+        Assert.Equal(2, n);
+        Assert.NotNull(await _store.GetItemByPathAsync(pid, "box"));
+        Assert.NotNull(await _store.GetItemByPathAsync(pid, "box/note.txt"));
+    }
+
+    [Fact]
     public async Task BulkUpsert_IsTransactionalAndIdempotent()
     {
         var pid = await NewProfileAsync();
