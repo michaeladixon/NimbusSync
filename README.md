@@ -73,8 +73,19 @@ Drive allows duplicate and case-variant names in one folder; Windows does not. T
 - Engine events fire on background threads; the WPF layer must marshal to the dispatcher.
 - 403 `userRateLimitExceeded` relies on the outbox backoff rather than header-driven throttling.
 
+## Desktop app
+
+`NimbusSync.App` is a Fluent-themed (Windows 11, follows system light/dark) WPF tray app:
+
+- **Tray icon** whose badge shows overall status (syncing, conflict, error, paused), with sync/pause/resume/quit actions and a toast per new conflict. Closing the window keeps syncing; Quit is in the tray menu. A second launch brings the running window forward.
+- **Sync folders**: one card per profile with live status, queued-operation count, Sync now, Pause/Resume, Edit, and Remove. `SyncHost` runs one `SyncEngine` per running profile, since an engine holds a single profile.
+- **Conflicts**: both sides' size and modified time, with Keep this PC / Keep Drive / Keep both. Resolving needs the profile running, because the engine plans the resolution.
+- **Activity**: operations, conflicts, and failures, newest first.
+- **Settings**: OAuth client ID/secret, connect/disconnect, start in tray, data and log folders.
+
+Profile rows carry the change token, so the UI never saves a profile while its engine runs: edits pause the profile, are applied to a fresh read, and resume. A profile's local folder and Drive location are fixed after creation. The add-folder dialog accepts a pasted Drive link or a raw ID.
+
 ## Next
 
-- WPF tray shell: NotifyIcon, settings, conflict list bound to `ConflictDetected`.
-- OAuth wiring and profile creation UI.
-- Drive folder picker for `RemoteFolderId` / `SharedDriveId`.
+- Drive folder picker for `RemoteFolderId` / `SharedDriveId` (today: paste a link or ID).
+- Wire `ProtectedFileDataStore` into `GoogleDriveProvider.CreateAsync` so the refresh token is DPAPI-protected (it currently uses `FileDataStore`).
